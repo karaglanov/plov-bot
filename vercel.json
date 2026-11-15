@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/*.ts": { "maxDuration": 300 }
+  },
+  "crons": [
+    { "path": "/api/evening", "schedule": "0 13 * * *" },
+    { "path": "/api/morning", "schedule": "0 5 * * *" }
+  ]
+}
