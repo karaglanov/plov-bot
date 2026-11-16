@@ -151,6 +151,11 @@ async function run(messages: Anthropic.Beta.Messages.BetaMessageParam[], maxSear
   throw new Error("Claude не закончил ответ за отведённое число шагов");
 }
 
+/** true, если подключён платный Claude API. Без него посты пишет Claude из проекта по расписанию. */
+export function hasApi(): boolean {
+  return Boolean(process.env.ANTHROPIC_API_KEY || process.env.MOCK_CLAUDE);
+}
+
 export async function writePost(inp: WriterInput): Promise<WriterOutput> {
   if (process.env.MOCK_CLAUDE) return mock(inp.forcedTopic || (inp.ideas[0] ? "Идея: " + inp.ideas[0].text.slice(0, 30) : "Тема из ресёрча"), inp.ideas[0]?.id);
   const text = await run([{ role: "user", content: userPrompt(inp) }], 6);

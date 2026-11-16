@@ -51,13 +51,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   );
   if (dbOk) await patchConfig({ baseUrl, ...(botId ? { botId, botUsername: botName } : {}) });
 
-  // 3. Claude
-  const keyErr = await checkKey();
-  rows.push(
-    keyErr
-      ? { ok: false, title: "Ключ Claude API", hint: `Не работает (${esc(keyErr)}). Создайте ключ на platform.claude.com → API keys, пополните баланс и добавьте его в Vercel как ANTHROPIC_API_KEY, потом Redeploy.` }
-      : { ok: true, title: "Ключ Claude API работает" },
-  );
+  // 3. Кто пишет посты
+  if (process.env.ANTHROPIC_API_KEY) {
+    const keyErr = await checkKey();
+    rows.push(
+      keyErr
+        ? { ok: false, title: "Ключ Claude API", hint: `Не работает (${esc(keyErr)}). Проверьте ANTHROPIC_API_KEY в Vercel или удалите его, чтобы посты писал Claude из проекта.` }
+        : { ok: true, title: "Посты пишет Claude API (платный режим, ответ за 1–2 минуты)" },
+    );
+  } else if ((process.env.AGENT_KEY || "").length >= 16) {
+    rows.push({ ok: true, title: "Посты пишет Claude из вашего проекта по расписанию (бесплатный режим)" });
+  } else {
+    rows.push({ ok: false, title: "Ключ для Claude", hint: "В Vercel → Settings → Environment Variables добавьте AGENT_KEY (строку прислал Claude в чате), потом Deployments → Redeploy." });
+  }
 
   // 4. Канал
   if (botOk) {

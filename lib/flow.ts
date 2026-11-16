@@ -4,7 +4,7 @@ import {
   del, getConfig, getDraft, getJSON, hall, hdel, hget, hset, list, once, patchConfig, push, saveDraft, setJSON,
 } from "./store";
 import { CHANNEL, TgError, esc, imageUrl, sendHtml, stripTags, tg, userName } from "./tg";
-import { revisePost, writePost } from "./claude";
+import { WriterOutput, hasApi, revisePost, writePost } from "./claude";
 
 // ---------------------------------------------------------------- время и расписание
 
@@ -139,12 +139,31 @@ async function gatherInput(slot: string, forcedTopic?: string, avoid?: string[])
   };
 }
 
-export async function makeDraft(opts: { slot?: string; forcedTopic?: string } = {}): Promise<Draft> {
-  const cfg = await getConfig();
-  if (!cfg.adminChat) throw new Error("Бот ещё не настроен: напишите /start в теме для черновиков");
-  const slot = opts.slot || nextSlotAfter(localNow());
-  const avoid = (await getJSON<string[]>("avoid:" + slot)) || [];
-  const out = await writePost(await gatherInput(slot, opts.forcedTopic, avoid));
+/** Когда Claude напишет пост: сразу (платный API) или при следующем запуске по расписанию (бесплатный режим). */
+function eta(): string {
+  return hasApi() ? "Пришлю через 1–2 минуты." : "Claude напишет его при следующем запуске по расписанию, обычно в течение нескольких часов.";
+}
+
+export interface Job {
+  id: string;
+  type: "draft" | "revise";
+  created: number;
+  slot?: string;
+  forcedTopic?: string;
+  draftId?: string;
+}
+
+async function enqueue(job: Omit<Job, "id" | "created">): Promise<Job> {
+  const jobs = await hall<Job>("jobs");
+  // Не плодим одинаковые задания: один черновик на дату без заданной темы, одна правка на черновик.
+  const same = Object.values(jobs).find((j) => j.type === job.type && (job.type === "revise" ? j.draftId === job.draftId : j.slot === job.slot && !j.forcedTopic && !job.forcedTopic));
+  if (same) return same;
+  const full: Job = { ...job, id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5), created: Math.floor(Date.now() / 1000) };
+  await hset("jobs", full.id, full);
+  return full;
+}
+
+async function createDraft(cfg: Config, out: WriterOutput, slot: string): Promise<Draft> {
   const d: Draft = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
     created: Math.floor(Date.now() / 1000),
@@ -162,6 +181,92 @@ export async function makeDraft(opts: { slot?: string; forcedTopic?: string } = 
   for (const id of d.ideaIds) await hset("idea_used", id, d.id);
   await sendDraftMessages(cfg, d);
   return d;
+}
+
+/** Пишет черновик сразу (если есть ключ Claude API) или ставит задание в очередь для Claude из проекта. */
+export async function makeDraft(opts: { slot?: string; forcedTopic?: string } = {}): Promise<Draft | null> {
+  const cfg = await getConfig();
+  if (!cfg.adminChat) throw new Error("Бот ещё не настроен: напишите /start в теме для черновиков");
+  const slot = opts.slot || nextSlotAfter(localNow());
+  if (!hasApi()) {
+    await enqueue({ type: "draft", slot, forcedTopic: opts.forcedTopic });
+    return null;
+  }
+  const avoid = (await getJSON<string[]>("avoid:" + slot)) || [];
+  const out = await writePost(await gatherInput(slot, opts.forcedTopic, avoid));
+  return createDraft(cfg, out, slot);
+}
+
+async function applyRevision(cfg: Config, d: Draft, out: WriterOutput): Promise<void> {
+  const wasApproved = d.status === "approved";
+  Object.assign(d, { topic: out.topic || d.topic, html: out.html, imagePrompt: out.imagePrompt || d.imagePrompt, alts: out.alts.length ? out.alts : d.alts, note: out.note, status: "pending", noPhotoOk: false });
+  await sendDraftMessages(cfg, d);
+  if (wasApproved) await say(cfg, "Текст изменился, поэтому одобрение снято. Нажмите ✅ под новой версией.");
+}
+
+// ---------------------------------------------------------------- очередь для Claude из проекта (бесплатный режим)
+
+function cleanOutput(r: any): WriterOutput {
+  const str = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+  const html = str(r?.html, 4000);
+  if (!html) throw new Error("в результате нет текста поста (html)");
+  return {
+    topic: str(r?.topic, 200) || "Без названия",
+    source: str(r?.source, 300),
+    usedIdeas: Array.isArray(r?.usedIdeas) ? r.usedIdeas.map(Number).filter((n: number) => Number.isInteger(n)) : [],
+    html,
+    imagePrompt: str(r?.imagePrompt, 2500),
+    alts: Array.isArray(r?.alts) ? r.alts.map((a: unknown) => str(a, 60)).filter(Boolean).slice(0, 2) : [],
+    note: str(r?.note, 800),
+  };
+}
+
+/** Задания, которые ждут Claude, вместе со всем, что нужно для работы. */
+export async function listJobs(): Promise<any[]> {
+  const jobs = Object.values(await hall<Job>("jobs")).sort((a, b) => a.created - b.created);
+  const out: any[] = [];
+  for (const j of jobs) {
+    if (j.type === "draft") {
+      const avoid = (await getJSON<string[]>("avoid:" + j.slot)) || [];
+      out.push({ id: j.id, type: "draft", input: await gatherInput(j.slot!, j.forcedTopic, avoid) });
+    } else {
+      const d = j.draftId ? await getDraft(j.draftId) : null;
+      if (!d || d.status === "published" || d.status === "cancelled") {
+        await hdel("jobs", j.id);
+        continue;
+      }
+      out.push({ id: j.id, type: "revise", current: { topic: d.topic, html: d.html, imagePrompt: d.imagePrompt }, instructions: d.revisions });
+    }
+  }
+  return out;
+}
+
+export async function completeJob(jobId: string, result: any): Promise<string> {
+  const job = await hget<Job>("jobs", jobId);
+  if (!job) throw new Error("задание не найдено или уже выполнено");
+  const cfg = await getConfig();
+  const out = cleanOutput(result);
+  if (job.type === "draft") {
+    await createDraft(cfg, out, job.slot!);
+  } else {
+    const d = await getDraft(job.draftId!);
+    if (d && d.status !== "published" && d.status !== "cancelled") await applyRevision(cfg, d, out);
+  }
+  await hdel("jobs", jobId);
+  return job.type;
+}
+
+/** Свежие данные из Telegram, чтобы Claude в проекте держал контекст актуальным. */
+export async function exportData(): Promise<any> {
+  const used = await hall<string>("idea_used");
+  return {
+    exportedAt: new Date().toISOString(),
+    ideas: (await list<Idea>("ideas")).map((i) => ({ ...i, used: String(i.id) in used })),
+    teamChat: await list<LogLine>("log"),
+    comments: await list<Comment>("comments"),
+    posts: await list<Post>("posts"),
+    reactions: await hall<number>("post_react"),
+  };
 }
 
 async function cancelDraft(cfg: Config, d: Draft, rememberTopic: boolean): Promise<void> {
@@ -276,9 +381,9 @@ export async function handleCallback(cq: any): Promise<void> {
       await publishDraft(cfg, d);
     } else if (action === "other" || /^alt\d$/.test(action)) {
       const forced = action === "other" ? undefined : d.alts[Number(action.slice(3))];
-      await answer(cq.id, "Пишу новый вариант, это займёт 1–2 минуты.");
+      await answer(cq.id, hasApi() ? "Пишу новый вариант, это займёт 1–2 минуты." : "Записал. Новый вариант придёт при следующем запуске Claude.");
       await cancelDraft(cfg, d, true);
-      await say(cfg, `♻️ Пишу другой пост${forced ? ` на тему «${esc(forced)}»` : ""}. Пришлю через 1–2 минуты.`);
+      await say(cfg, `♻️ Будет другой пост${forced ? ` на тему «${esc(forced)}»` : ""}. ${eta()}`);
       await makeDraft({ slot: d.slot, forcedTopic: forced });
     } else {
       await answer(cq.id);
@@ -392,6 +497,13 @@ async function attachPhoto(cfg: Config, d: Draft, msg: any): Promise<void> {
 async function revise(cfg: Config, d: Draft, instruction: string): Promise<void> {
   if (d.status === "published") return void (await say(cfg, "Этот пост уже опубликован, поправить его можно только вручную в канале."));
   if (d.status === "cancelled") return void (await say(cfg, "Этот черновик отменён. Новый можно попросить командой /post."));
+  if (!hasApi()) {
+    d.revisions.push(instruction);
+    await saveDraft(d);
+    await enqueue({ type: "revise", draftId: d.id });
+    await say(cfg, "✍️ Записал правку. " + eta().replace("напишет его", "перепишет пост"));
+    return;
+  }
   if (!(await once("lock:" + d.id, 240))) return;
   try {
     await say(cfg, "✍️ Переписываю, пришлю через минуту.");
@@ -400,10 +512,7 @@ async function revise(cfg: Config, d: Draft, instruction: string): Promise<void>
       { topic: d.topic, source: d.source, usedIdeas: d.ideaIds, html: d.html, imagePrompt: d.imagePrompt, alts: d.alts, note: d.note || "" },
       d.revisions,
     );
-    const wasApproved = d.status === "approved";
-    Object.assign(d, { topic: out.topic, html: out.html, imagePrompt: out.imagePrompt, alts: out.alts, note: out.note, status: "pending", noPhotoOk: false });
-    await sendDraftMessages(cfg, d);
-    if (wasApproved) await say(cfg, "Текст изменился, поэтому одобрение снято. Нажмите ✅ под новой версией.");
+    await applyRevision(cfg, d, out);
   } catch (e) {
     await reportError(cfg, e);
   } finally {
@@ -472,7 +581,7 @@ export async function handleMessage(msg: any): Promise<void> {
     if (!boss) return;
     try {
       if (c.cmd === "post") {
-        await say(cfg, c.arg ? `✍️ Пишу пост на тему «${esc(c.arg)}». Пришлю через 1–2 минуты.` : "✍️ Выбираю тему и пишу пост. Пришлю через 1–2 минуты.");
+        await say(cfg, (c.arg ? `✍️ Будет пост на тему «${esc(c.arg)}». ` : "✍️ Будет новый пост. ") + eta());
         await makeDraft({ forcedTopic: c.arg || undefined });
       } else if (c.cmd === "ideas") {
         const used = await hall<string>("idea_used");
@@ -598,8 +707,8 @@ export async function eveningJob(): Promise<string> {
     const slot = dstr(tomorrow);
     if (await once("gen:" + slot, 3 * 86400)) {
       try {
-        await makeDraft({ slot });
-        done.push("черновик на " + slot);
+        const made = await makeDraft({ slot });
+        done.push((made ? "черновик на " : "задание на черновик на ") + slot);
       } catch (e) {
         await del("gen:" + slot);
         await reportError(cfg, e);

@@ -6,7 +6,7 @@
   "scripts": {
     "context": "node scripts/build-context.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "TELEGRAM_BOT_TOKEN=123:TEST MOCK_CLAUDE=1 tsx test/run.ts && TELEGRAM_BOT_TOKEN=123:TEST MOCK_CLAUDE=1 POST_DAYS=0,1,2,3,4,5,6 tsx test/cron.ts"
+    "test": "TELEGRAM_BOT_TOKEN=123:TEST MOCK_CLAUDE=1 tsx test/run.ts && TELEGRAM_BOT_TOKEN=123:TEST MOCK_CLAUDE=1 POST_DAYS=0,1,2,3,4,5,6 tsx test/cron.ts && TELEGRAM_BOT_TOKEN=123:TEST AGENT_KEY=test-agent-key-0123456789 POST_DAYS=0,1,2,3,4,5,6 tsx test/agent.ts"
   },
   "engines": {
     "node": "22.x"
