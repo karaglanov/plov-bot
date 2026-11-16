@@ -1,7 +1,7 @@
 // Минимальный клиент Telegram Bot API.
 import { createHash, createHmac } from "node:crypto";
 
-export const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+export const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim().replace(/^bot/i, "");
 export const CHANNEL = normalizeChannel(process.env.CHANNEL || "@marketing_plov");
 
 function normalizeChannel(c: string): string | number {
