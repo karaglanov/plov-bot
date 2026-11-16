@@ -70,9 +70,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       const m = await tg("getChatMember", { chat_id: CHANNEL, user_id: botId });
       const can = m.status === "administrator" && m.can_post_messages !== false;
-      rows.push(can ? { ok: true, title: `Бот может публиковать в ${CHANNEL}` } : { ok: false, title: `Канал ${CHANNEL}`, hint: `Добавьте @${botName} администратором канала и включите право «Публикация сообщений».` });
-    } catch {
-      rows.push({ ok: false, title: `Канал ${CHANNEL}`, hint: `Добавьте @${botName} администратором канала и включите право «Публикация сообщений». Остальные права можно выключить.` });
+      const why = m.status !== "administrator" ? `сейчас Telegram видит бота как «${esc(m.status)}», а не администратора` : "у бота выключено право «Публикация сообщений»";
+      rows.push(can ? { ok: true, title: `Бот может публиковать в ${CHANNEL}` } : { ok: false, title: `Канал ${CHANNEL}`, hint: `${why}. Добавьте @${botName} администратором канала и включите право «Публикация сообщений».` });
+    } catch (e: any) {
+      rows.push({ ok: false, title: `Канал ${CHANNEL}`, hint: `Telegram ответил: ${esc(String(e?.description || e?.message || e))}. Проверьте, что адрес канала ${CHANNEL} и бот добавлен администратором с правом «Публикация сообщений».` });
     }
   }
 
