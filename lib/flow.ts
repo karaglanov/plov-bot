@@ -705,7 +705,10 @@ export async function eveningJob(): Promise<string> {
   const tomorrow = addDays(now, 1);
   if (POST_DAYS.includes(tomorrow.getUTCDay())) {
     const slot = dstr(tomorrow);
-    if (await once("gen:" + slot, 3 * 86400)) {
+    // Если на этот день уже есть черновик (например, сделан через /post), второй не готовим.
+    const index = await hall<{ status: string; slot: string }>("drafts");
+    const hasDraft = Object.values(index).some((d) => d.slot === slot && d.status !== "cancelled");
+    if (!hasDraft && (await once("gen:" + slot, 3 * 86400))) {
       try {
         const made = await makeDraft({ slot });
         done.push((made ? "черновик на " : "задание на черновик на ") + slot);
